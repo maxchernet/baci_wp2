@@ -1,9 +1,23 @@
-#
-# **************************************************************************
-# Create time series of tiff images of MODIS normalized reflectance
-# using Jose's modis_data tool
-# **************************************************************************
-#
+"""
+BRDF-Kernel based Edge preserving optimization for BACI regional sites - kernel_opt_regional_edge
+
+Version 1.0.31
+
+@authors: Maxim Chernetskiy, Jose Gomez-Dans
+University College London (UCL) 2018
+
+This is a part of the Work Packape 2 (WP2) of the BACI project.
+BACI Surface State Vector
+Edge preserved temporal regularization of the MODIS MOD09 Surface reflectance.
+This code is designed for working on the JASMIN cluster
+
+We use regularised linear Kernel BRDF models for normalisation of surface reflectance to
+nadir view (Quaife2010). This method provides both estimation posterior uncertainties and
+filling gaps in time series. Reflectance at nadir is calculated by inversion and forward
+run of the Kernel models.
+
+"""
+
 import os
 import glob
 import modis_data
@@ -14,7 +28,6 @@ import sys
 import h5py
 import netCDF4 as nc
 import datetime
-#import os
 import gp_emulator as gp
 import scipy.stats as ss
 import scipy.sparse as sp
@@ -25,11 +38,12 @@ from datetime import datetime as dt
 import julday
 import optparse
 import threading
-
 import pdb
 import time
-
 import matplotlib.pyplot as plt
+from kernels import Kernels
+
+
 
 host_name = os.uname()[1]
 print 'Host is ', host_name
@@ -39,68 +53,70 @@ else:
     #if '.rl.' in host_name:
     sys.path.append('/home/users/sigil/install/brdf_jose/brdf_filter_max/brdf_filter/')
 
-    
-from kernels import Kernels
 
 
-# ********************************************************************************
 
-class opt_img(object):
+class OptImg(object):
+    """
+    Main class for working with the optical images (OptImg)
+    """
     def     __init__(self):
         """
         Contructor of the class
         """
 
-        # self.threshold = 3.
         self.gamma_min = 3
         self.gamma_max = 12
         self.n_samples = 40
-        # self.do_plots = False
-        # self.do_albedo = True
-        # self.verbose = True
-
         self.nbands = 7
         self.bu = np.array([0.004, 0.015, 0.003, 0.004, 0.013, 0.010, 0.006])
 
-        # Determine 250 or 500 meters product
-        # self.resolution = 500
 
-        # self.pixelWidth = 500
-        # self.pixelHeight = 500
-
-    # ********************************************************************************
 
     def outlier_filter(self, doys, refl, y_fwd, bu, fname, unc=None, threshold=20.,
                        do_plots=True):
         """
+        Filtering outliers in time series. This procedure is based on
+        difference between original reflectance and reflectance from
+        forward run of the model
 
-        :param doys:
-        :param refl:
-        :param y_fwd:
-        :param bu:
-        :param fname:
-        :param unc:
-        :param threshold:
-        :param do_plots:
+        Parameters
+        -----------
+        :param doys: array
+            Day of Year array
+        :param refl: array
+            Time series of original reflectance
+        :param y_fwd: array
+            Reflectance from forward run of the model
+        :param bu: array
+            Per band uncertainties
+        :param fname: str
+            File name of a figure to save
+        :param unc: array
+            Estimated uncertainties (model)
+        :param threshold: float
+        :param do_plots: bool
         :return:
+        rpasar: array
+            Estimated differenec between forwad run and original reflectances
+        pasar: array
+            Bollean array where dufference < given threshold
         """
         n_bands = refl.shape[1]
         if do_plots:
             fig, axs = plt.subplots(figsize=(14, 12), nrows=n_bands, ncols=1,
                                     sharex=True)
             axs = axs.flatten()
-        pasar = np.ones(doys.shape[0])#y_fwd * 0.
+        pasar = np.ones(doys.shape[0])
         pasar = pasar.astype(np.bool)
         rpasar = (y_fwd * 0).astype(np.float)
-        for band in [0,1,2,3,4,6]: #xrange(n_bands):
+        for band in [0,1,2,3,4,6]:
 
             rpasar[doys-1, band] = np.abs(y_fwd[doys-1, band] - refl[:, band]) / self.bu[band]
-            # pasar[:, band] = (rpasar[:, band] <= threshold)
             for i in xrange(pasar.shape[0]):
                 pasar[i] = np.invert(rpasar[doys-1, band][i] > threshold)
 
             if do_plots:
-                #sel = pasar[:, band]
                 sel = pasar
                 axs[band].vlines(doys, refl[:, band] - threshold * self.bu[band],
                                  refl[:, band] + threshold * self.bu[band], color="0.8",
@@ -109,20 +125,17 @@ class opt_img(object):
                 axs[band].plot(doys[~sel], refl[~sel, band], 'o', mfc="none")
 
                 axs[band].plot(doys[sel], y_fwd[sel, band], '-')
-                #pretty_axes(axs[band])
 
         if do_plots:
-            # fig.savefig('pdf/' + fname.replace(".txt", "_outliers.pdf"),
-            #             dpi=150, bbox_inches="tight")
             fig.savefig(fname, dpi=150, bbox_inches="tight")
 
         return rpasar, pasar
 
-    # *******************************************************************************************************
 
 
     def create_regulariser (self, nx, lag=1):
-        """Creates a regulariser with a default lag of 1. Clearly, other lags can be
+        """
+        Creates a regulariser with a default lag of 1. Clearly, other lags can be
         specified by changing ``lag``.
 
         Parameters
@@ -147,14 +160,40 @@ class opt_img(object):
         DD2 = np.array([Z, Z, D2]).reshape ( nx*3, nx).T # HACK! 10*
         DD = np.array( [ DD0, DD1, DD2]).reshape ((nx*3, nx*3))
         DD = sp.lil_matrix( DD )
+
         return DD
 
-    def predict_refl (self, xsol, doys, vza, sza, raa, rho, do_plots=True, ndoys=365 ):
-        """Having an estimate of the kernel weights over an entire period
+
+
+    def predict_refl (self, xsol, doys, vza, sza, raa, rho, do_plots=False, ndoys=365 ):
+        """
+        Having an estimate of the kernel weights over an entire period
         of time, this function will simulate observations acquired for the
         same spectral band, stored in rho and with geometries given by
         vza, sza and raa. The doys are the dates of the observations and
         refer to the position of the time step in the xsol array.
+
+         Parameters
+        -----------
+        :param xsol: array
+            Three-kernel solution
+        :param doys: array
+            Day of year array
+        :param vza: array
+            View Zenith Angles
+        :param sza: array
+            Solar Zenith Angles
+        :param raa: array
+            Relative Azimuth
+        :param rho: array
+            original reflectance
+        :param do_plots: bool
+        :param ndoys: int
+        :return:
+        rmse: float
+            Root Mean Square Error
+        rho_fwd: array
+            Forward model run reflectance
         """
         passer = (doys - 1).astype(np.int)
         # Max: ndoys
@@ -162,14 +201,13 @@ class opt_img(object):
         f1 = xsol[ndoys:(ndoys*2)][passer]
         f2 = xsol[(ndoys*2):][passer]
 
-
-
         KK =  Kernels( vza, sza, raa, \
                 LiType='Sparse', doIntegrals=False, \
                 normalise=1, RecipFlag=True, RossHS=False, MODISSPARSE=True, \
                 RossType='Thick' )
 
         rho_fwd = f0 + KK.Ross[:]*f1 + KK.Li[:]*f2
+
         if do_plots:
             plt.figure(figsize=(15,10))
             plt.subplot(2,2,1)
@@ -177,13 +215,10 @@ class opt_img(object):
             plt.plot(doys, rho, 'o', label='rho')
             plt.grid()
             plt.legend()
-
-            #plt.figure(figsize=(15,10))
             plt.subplot(2, 2, 2)
             plt.plot(doys, rho- rho_fwd, 'o', label='rho - rho_fwd')
             plt.grid()
             plt.legend()
-            #plt.figure(figsize=(15,10))
             plt.subplot(2, 2, 3)
             plt.plot(rho, rho_fwd, 'o', label='rho vs fwd')
             bb = [ rho.min()*0.95, rho.max()*1.1]
@@ -197,21 +232,19 @@ class opt_img(object):
             plt.plot(rho_fwd, marker='o', label='rho_fwd')
             plt.legend()
             plt.tight_layout()
-            #plt.show()
-        # rmse = (rho-rho_fwd).std()
-        # rmse = (rho - f0).std()
-        # rmse = np.sqrt(((rho - rho_fwd)**2).mean()/rho.shape[0])
+            plt.show()
+
         rmse = np.sqrt(((rho - f0) ** 2).mean() / rho.shape[0])
+
         return rmse, rho_fwd
 
-    # **********************************************************************************************************************
 
-    # **********************************************************************************************************************
 
-    def solve_regularised_problem (self, lambdas, band_unc, doys, vza, sza, raa, rho,
+    def solve_regularised_problem(self, lambdas, band_unc, doys, vza, sza, raa, rho,
                                    doy_range=None, do_unc=False):
 
-        """Solve the regularised linear kernel BRDF problem. The function solves
+        """
+        Solve the regularised linear kernel BRDF problem. The function solves
         for the kernel weights (f0, f1 and f2) for one or more spectral bands,
         taking into account the inherent uncertainty in the observations, the
         acquisition timing and geometries. The inversion is made more robust with a
@@ -271,6 +304,7 @@ class opt_img(object):
             n_bands = len ( band_unc )
         else:
             n_bands = band_unc.shape[1]
+
         # The state grid is calculated by default, or the user provided one is used.
 
         if doy_range is None:
@@ -281,7 +315,7 @@ class opt_img(object):
 
         # Some information that'll be used for array size calculations.
         # Some of observations can be missed
-        # num_doys = len(doy_range)
+
         num_doys = np.max(doy_range)
 
         all_obs = [list(doys).count(x) \
@@ -312,7 +346,6 @@ class opt_img(object):
                     K [ i_obs, doy - first_day ]  = 1.0 # Isotropic
                     K [ i_obs, doy - first_day + num_doys ] = \
                                         K_obs.Ross[ix]
-                    # print i
                     K [ i_obs, doy - first_day + num_doys*2 ] = \
                                         K_obs.Li[ix]
 
@@ -338,26 +371,17 @@ class opt_img(object):
 
         # Do a per band inversion in this next loop
 
-        # print 'lambdas:', lambdas.shape
-        # print '(D.T.dot(D)):', (D.T.dot(D)).shape
         regularisation_term = lambdas*(D.T.dot(D))
-        # print 'lambdas:', lambdas.shape, type(lambdas)
-        # print np.diag(lambdas).shape
-        # regularisation_term = np.diag(lambdas) * (D.T.dot(D))
-        # print 'regularisation_term:', regularisation_term.shape
 
         unc = []
 
-        # !!! Max
         cov_mat_full = []
 
         for band in xrange ( n_bands ):
             covariance_matrix = sp.lil_matrix ( ( all_obs.sum(),
                         all_obs.sum()))
             covariance_matrix.setdiag ( cov_mat[:,band] )
-            # print 'K.T*covariance_matrix*K:', (K.T*covariance_matrix*K).shape
             A = (K.T*covariance_matrix*K + regularisation_term).tocsc()
-            #A = (K.T*covariance_matrix*K).tocsc()
             b = ((K.T*covariance_matrix)*y[ :, band]).tocsc()
 
             retval = sp.linalg.spsolve ( A, b )
@@ -376,22 +400,15 @@ class opt_img(object):
                     print "Factor is exactly singular????"
                     return np.array([[-1],[-1]]), [-1], [-1], [-1], [-1], [-1]
 
-                # !!! Max
                 # I commented it in hope that it can speed the process up
                 # cov_mat_full.append(A)
 
             timeAfter = time.clock()
-            #print 'price of unc. calc.:', timeAfter - timeBefore
 
             passer = (doys - 1).astype(np.int)
 
             x_sol [ :, band ] = retval
             y_fwd[ passer, band] = np.array ( K*retval ).squeeze()
-
-            # ndoys = doy_range.shape[0]
-            # f0 = x_sol[:ndoys, band][passer]
-            # f1 = x_sol[ndoys:(ndoys * 2), band][passer]
-            # f2 = x_sol[(ndoys * 2):, band][passer]
 
             f0 = x_sol[:num_doys, band][passer]
             f1 = x_sol[num_doys:(num_doys * 2), band][passer]
@@ -412,12 +429,50 @@ class opt_img(object):
 
 
 
-    # **********************************************************************************************************************
-
-
-
     def solve_regularised_problem_edge(self, lambdas, band_unc, doys, vza, sza, raa, rho,
                                   doy_range=None, do_unc=False):
+        """
+        Edge preserving verssion of solve_regularised_problem
+
+        Parameters
+        -----------
+        lambdas: float
+            The value of the 1 timestep lag regularisation scalar. 0 effecitvely
+            shuts of the regularisation, and a very large value will lead to fitting
+            a constant value over the entire time series.
+        band_unc: array
+            The per band uncertainty. This can either be a 1D array, where the per
+            band uncertainty is assumed identical for all measurements in that band,
+            or you can have a 2D array, where the uncertainty is given by
+            observation.
+        doys: array
+            The time of the observations. Make sure this is an integer.
+        vza: array
+            The array of view zenith angles (in degrees).
+        sza: array
+            The array of solar zenith angles (in degrees).
+        raa: array
+            The array of relative azimuth angles (in degrees).
+        rho: array
+            The reflectance data, a 2D array, where the first dimension is time, and
+            the second is spectral band (e.g. 365*7).
+        doy_range: array, optional
+            A time array to report the kernel weights on. If not set, the function
+            will do this from the first time step to the last in the doys.
+        do_unc: boolean, optional
+            Whether you want the function to calculate the posterior uncertainty.
+
+        Returns
+        ----------
+        x_sol: array
+            The solution array
+        rmse: float
+            RMSE value
+        y_fwd: array
+            Predicted observation reflectance
+        y_orig: array
+            Original reflectance
+        """
 
         # The number of kernels is 3
         n_kernels = 3
@@ -436,7 +491,7 @@ class opt_img(object):
 
         # Some information that'll be used for array size calculations.
         # Some of observations can be missed
-        # num_doys = len(doy_range)
+
         num_doys = np.max(doy_range)
 
         all_obs = [list(doys).count(x) \
@@ -467,7 +522,7 @@ class opt_img(object):
                     K[i_obs, doy - first_day] = 1.0  # Isotropic
                     K[i_obs, doy - first_day + num_doys] = \
                         K_obs.Ross[ix]
-                    # print i
+
                     K[i_obs, doy - first_day + num_doys * 2] = \
                         K_obs.Li[ix]
 
@@ -493,13 +548,6 @@ class opt_img(object):
 
         # Do a per band inversion in this next loop
 
-        # print 'lambdas:', lambdas.shape
-        # print '(D.T.dot(D)):', (D.T.dot(D)).shape
-        # regularisation_term = lambdas*(D.T.dot(D))
-        # print 'lambdas:', lambdas.shape, type(lambdas)
-        # print np.diag(lambdas).shape
-
-
         unc = []
 
         # !!! Max
@@ -508,14 +556,11 @@ class opt_img(object):
         for band in xrange(n_bands):
 
             regularisation_term = sp.lil_matrix(np.diag(lambdas[:,band]) * (D.T.dot(D)))
-            # print 'regularisation_term:', regularisation_term.shape
 
             covariance_matrix = sp.lil_matrix((all_obs.sum(),
                                                all_obs.sum()))
             covariance_matrix.setdiag(cov_mat[:, band])
-            # print 'K.T*covariance_matrix*K:', (K.T * covariance_matrix * K).shape
             A = (K.T * covariance_matrix * K + regularisation_term).tocsc()
-            # A = (K.T*covariance_matrix*K).tocsc()
             b = ((K.T * covariance_matrix) * y[:, band]).tocsc()
 
             retval = sp.linalg.spsolve(A, b)
@@ -534,22 +579,12 @@ class opt_img(object):
                     print "Factor is exactly singular????"
                     return np.array([[-1], [-1]]), [-1], [-1], [-1], [-1], [-1]
 
-                    # !!! Max
-                    # I commented it in hope that it can speed the process up
-                    # cov_mat_full.append(A)
-
             timeAfter = time.clock()
-            # print 'price of unc. calc.:', timeAfter - timeBefore
 
             passer = (doys - 1).astype(np.int)
 
             x_sol[:, band] = retval
             y_fwd[passer, band] = np.array(K * retval).squeeze()
-
-            # ndoys = doy_range.shape[0]
-            # f0 = x_sol[:ndoys, band][passer]
-            # f1 = x_sol[ndoys:(ndoys * 2), band][passer]
-            # f2 = x_sol[(ndoys * 2):, band][passer]
 
             f0 = x_sol[:num_doys, band][passer]
             f1 = x_sol[num_doys:(num_doys * 2), band][passer]
@@ -575,29 +610,51 @@ class opt_img(object):
     def guess_gamma_opt (self, rho, sza, vza, raa, bu, doys,\
                          gamma_min=1, gamma_max=12, n_samples=41,\
                          do_plots=True, verbose=True, doy_range=np.arange(1, 366) ):
+        """
+        Estimate optimal regularization parameter (gamma) by cross validation
 
-        #terra_doys, terra_sza, terra_vza, terra_raa, terra_refl, terra_bu =  \
-        #        read_refl_data ( fname,  sensor="terra" )
-
-        #aqua_doys, aqua_sza, aqua_vza, aqua_raa, aqua_refl, aqua_bu =  \
-        #        read_refl_data ( fname, sensor="aqua" )
-        # Max: ( 1, 366 ) ->  ( 1, ndoys+1 )
-        # doy_range = np.arange ( 1, ndoys+1 )
+        Parameters
+        -----------
+        :param rho: array
+            Input reflectance
+        :param sza: array
+            Sun Zenith Angle
+        :param vza: array
+            View Zenith Angle
+        :param raa: array
+            Relative Azimuth
+        :param bu: array
+            Per band uncertainties
+        :param doys: array
+            Array of Days of Year
+        :param gamma_min: float
+            Minumum range of gamma values
+        :param gamma_max: float
+            Maxim gamma value
+        :param n_samples: array
+            Number of samples
+        :param do_plots: bool
+        :param verbose:
+        :param doy_range:
+        :return:
+        """
 
         # Make random samples for cross validation
-        # ii = np.unique((np.random.rand(doys.shape[0]/0.9) * (doys.shape[0]-1)).astype(int))
-
         dist = ss.uniform(loc=0, scale=doys.shape[0])
         ii = np.unique(np.squeeze(gp.lhd(dist=dist, size=int(doys.shape[0]/1.5))).astype(int))
 
         ind = np.zeros(doys.shape[0]).astype(bool)
         ind[ii] = True
+
+        # Use these to estimate regularized reflectance
         terra_refl = rho[ind]
         terra_doys = doys[ind]
         terra_sza = sza[ind]
         terra_vza = vza[ind]
         terra_raa = raa[ind]
         terra_bu = self.bu
+
+        # And and these are for validation
         ind = np.invert(ind)
         aqua_refl = rho[ind]
         aqua_doys = doys[ind]
@@ -606,79 +663,59 @@ class opt_img(object):
         aqua_raa = raa[ind]
         aqua_bu = self.bu
 
-        # plt.plot(terra_doys, terra_refl[:, 1], marker='o', ls='--', c='r')
-        # plt.plot(aqua_doys, aqua_refl[:, 1], marker='o', ls='--', c='b')
-        # plt.show()
-
-
-        #nr, nc = n_subplots ( n_samples )
         n_bands = 7
-        xx = np.zeros((8,n_samples))
-        # if do_plots:
-        #     fig1, axs1 = plt.subplots ( figsize=(14, 12), nrows=nr, ncols=nc,
-        #             sharex=True )
-        #     fig2, axs2 = plt.subplots ( figsize=(14, 12), nrows=nr, ncols=nc,
-        #             sharex=True )
-        #     axs1 = axs1.flatten()
-        #     axs2 = axs2.flatten()
+        xx = np.zeros((8, n_samples))
+
         if verbose:
             print "%-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s" % ( "gamma",
                     "B01", "B02", "B03","B04", "B05", "B06", "B07" )
 
+        # Estimate solution (x_sol) for each gamma from the given range
         for i, gammas in enumerate( np.logspace( gamma_min, gamma_max, n_samples) ):
 
-            #try:
             x_sol, rmse, y_fwd, y_orig = self.solve_regularised_problem(gammas, terra_bu,
                                                     terra_doys, terra_vza, terra_sza,
                                                     terra_raa, terra_refl,
                                                     doy_range=doy_range)
-            #except:
-            #    print 'regularised problem in guess_gamma_opt has not solved'
-            #    continue
 
-            # if do_plots:
-            #     # Max: x_sol[:365, 1] -> x_sol[:ndoys, 1]
-            #     axs1[i].plot(doy_range, x_sol[:doy_range.shape[0], 1], '-')
-            #     axs1[i].set_title ( "%8.2E" % gammas )
-            #     pretty_axes ( axs1[i])
             sys.stdout.flush()
             this_line = "%8.2E" % gammas
             xx[0,i] = gammas
+
+            # Predict reflectance for each of the bands
             for band in xrange(7):
                 # Max: ndoys=ndoys
                 rmse, rho_fwd = self.predict_refl( x_sol[:,band], aqua_doys,
                                    aqua_vza, aqua_sza, aqua_raa,
-                                   aqua_refl[:,band], do_plots=False, ndoys=np.max(doy_range))#doy_range.shape[0] )
+                                   aqua_refl[:,band], do_plots=False, ndoys=np.max(doy_range))
                 this_line = this_line + " %5.2E" % rmse
                 xx[band+1, i] = rmse
-                # if do_plots and band == 1:
-                #     axs2[i].plot ( aqua_doys, aqua_refl[:,band], 'o')
-                #     axs2[i].plot ( aqua_doys, rho_fwd, '-')
-                #     axs2[i].set_title ( "%8.2E (RMSE: %5.1E)" % (gammas, rmse),
-                #                       fontsize=8)
-                #     pretty_axes ( axs2[i])
+
             if verbose:
                 print this_line
 
-
-        gamma_opt = xx[0, xx[np.array([1,2,3,4,5,7]),:].argmin(axis=1)].min()
-        # print "Chose %g" % ( gamma_opt )
-
-        opt_rmse = np.sum(xx[np.array([1,2,3,4,5,7]),:].min(axis=1))
+        # Find optimal gamma by minimum RMSE
+        gamma_opt = xx[0, xx[np.array([1,2,3,4,5,7]), :].argmin(axis=1)].min()
+        opt_rmse = np.sum(xx[np.array([1,2,3,4,5,7]), :].min(axis=1))
 
         return gamma_opt, opt_rmse
 
-    # **********************************************************************************************************************
 
 
-
-    #
-    # ************************************************************************************
-    #
     def save_m_years(self, fnames, site='somalia'):
-        #
-        # Save a file which consists of multiple years
-        #
+        """
+        Save a file which consists of multiple years
+
+        :param fnames: array
+            File names
+        :param site: str
+            Name of BACI test site
+        :return:
+            fn: str
+                Output ASCII file name
+            doy_range: arrat
+                Range of DOYs
+        """
         dd = np.zeros((1, 15))
         for i in range(fnames.shape[0]):
                 d = np.loadtxt(fnames[i])
@@ -691,29 +728,47 @@ class opt_img(object):
                     header=open(fnames[0], 'r').read().split('\n')[0])
         ndoys = dd[-1, 0].astype(int)
         doy_range = np.arange(dd[0, 0].astype(int), ndoys + 1)
+
         return fn, doy_range
 
-    #
-    # ************************************************************************
-    #
+
+
     def get_n_days(self, year):
+        """
+        Get number of days in year
+
+        :param year: int
+        :return:
+            n_days: int
+            date_range: array
+        """
         n_days = (datetime.date(year, 12, 31) - datetime.date(year, 1, 1)).days + 1
         date_range = np.array([(datetime.date(year, 1, 1) + datetime.timedelta(days=i)).strftime('%Y.%m.%d')\
                                for i in range(0, n_days)])
         return n_days, date_range
 
-    #
-    # ************************************************************************
-    #
-    def make_vrt(self, tile, year, loc, dir_vrt):
 
-        # Create virtual datasets based of MODIS images
+
+    def make_vrt(self, tile, year, loc, dir_vrt):
+        """
+        Create virtual datasets based of MODIS images
+
+        :param tile: str
+            MODIS tile
+        :param year: int
+            Year of data acquisition
+        :param loc: str
+            Data location
+        :param dir_vrt: str
+            Output directory
+        :return:
+        """
 
         m = modis_data.MODISFinder( tile=tile, year=year, head_loc=loc)
         m.create_virtual_data(dir_vrt)
-    #
-    # ************************************************************************
-    #
+
+
+
     def get_time_series(self, tile, year, loc, px, py, cols=1, rows=1, step=1, save_dir='txt/'):
         """
         Read time series of reflectance data and save to a pkl file
@@ -723,8 +778,6 @@ class opt_img(object):
         tile: MODIS tile
         loc: directory of data
         """
-
-        # keys = ['sza', 'saa', 'vza', 'vaa', 'qa', 'b01', 'b02', 'b03', 'b04', 'b05', 'b06', 'b07']
 
         timeBefore = time.clock()
 
@@ -737,25 +790,17 @@ class opt_img(object):
 
         # get DOYs from file name
         doys0 = np.sort([int(s.split('_')[4]) for s in f_list])
-        # print 'doys0', doys0
 
         # arrange DOYs according to step. I.e. we assume that...
-        # step = 7
         doys = np.zeros(doys0.shape).astype(int)
         doys_real = np.zeros(doys0.shape).astype(int)
 
         for jj, ii in enumerate(xrange(0, doys0.shape[0]+1, step)):
-            # doys = np.append(doys, doys0[ii:ii+7])
-            doys[ii:ii+step] = jj + 1#doys0[ii]
+            doys[ii:ii+step] = jj + 1
             doys_real[ii:ii+step] = doys0[ii]
 
         ind = np.argsort([int(s.split('_')[4]) for s in f_list])
         f_list = f_list[ind]
-
-        # print 'loc:', loc
-        # print 'tile:', tile
-        # print 'year:', year
-        # print 'f_list:', f_list[0]
 
         output = {}
         for f  in f_list:
@@ -785,19 +830,16 @@ class opt_img(object):
 
         for key in ds.variables.keys():
             if len(ds.variables[key].shape) == 2:
-                # output[key] = np.zeros((f_list.shape[0], ds.variables[key].shape[0], ds.variables[key].shape[1]))
                 output[key] = np.zeros((f_list.shape[0], cols, rows))
             if len(ds.variables[key].shape) == 1:
                 output[key] = np.zeros(ds.variables[key].shape[0]).astype(str)
 
         for i, fname in enumerate(f_list):
-            #print fname
             ds = nc.Dataset(fname)
             for key in ds.variables.keys():
                 if len(ds.variables[key].shape) == 2:
 
                     try:
-                        # print ds.variables[key][px:px+cols, py:py+rows]
                         output[key][i, :, :] = ds.variables[key][px:px+cols, py:py+rows]
                     except:
                         print 'something wrong in output[%s][%d, :, :]' % (key, i)
@@ -806,8 +848,6 @@ class opt_img(object):
 
                 if len(ds.variables[key].shape) == 1:
                     output[key][:] = ds.variables[key][:]
-
-        # print 'output.keys:', output.keys()
 
         QA_OK = np.array([8, 72, 136, 200, 1288, 2056, 2120, 2184, 2248])
         qa_passer = np.logical_or.reduce([output['qa'] == x for x in QA_OK])
@@ -824,8 +864,6 @@ class opt_img(object):
             output['qa_passer'] = qa_passer
             [bin(b) for b in QA_OK]
 
-            #doys = np.array([int(g.GetRasterBand(b+1).GetMetadata()['DoY']) for b in xrange(g.RasterCount)])
-            #years = np.array([int(g.GetRasterBand(b + 1).GetMetadata()['Year']) for b in xrange(g.RasterCount)])
         output['doys'] = doys
         output['doys_real'] = np.unique(doys_real)
         output['years'] = np.ones(doys.shape) * year
@@ -842,11 +880,6 @@ class opt_img(object):
         output['b06'] = output['b06'] / 10000.
         output['b07'] = output['b07'] / 10000.
 
-        # print 'qa_passer:', output['qa_passer']
-        #print output['b01']
-
-        #pkl.dump(output, open(f_out, 'wb'))
-
         timeAfter = time.clock()
         elapsed_time = timeAfter - timeBefore
         print 'read time series time (s): ', elapsed_time
@@ -854,69 +887,74 @@ class opt_img(object):
         print 'Read MODIS for year %d data is done' % year
         return output
 
-    #
-    #****************************************************************************
-    #
 
-    def get_rho(self, d, x, y):
+
+    def get_rho(self, data_dict, x, y):
         """
-        Gets
-        :param fname:
-        :param x:
-        :param y:
+        Get reflectance by X and Y pixel coordinates
+
+        :param data_dict: dictionary
+        :param x: int
+        :param y: int
         :return:
+        rho: array
+            Vector of reflectance for given X and Y
+        doys: array
+            Vector of DOYs
+        years: array
+        sza: array
+            Sun Zenith Angles
+        vza: array
+            View Zenith Angles
+        raa: array
+            Relative Azimuth
         """
 
         rho = np.zeros((1, 7))
         doys = []; years = []; sza = []; vza = []; raa = []
 
-        #for i, fname in enumerate(fnames):
-            #d = pkl.load(open(fname, 'r'))
-
-        sza = d['sza'][:, y, x][d['qa_passer'][:, y, x]]
-        vza = d['vza'][:, y, x][d['qa_passer'][:, y, x]]
-        raa = d['saa'][:, y, x][d['qa_passer'][:, y, x]] - d['vaa'][:, y, x][d['qa_passer'][:, y, x]]
+        sza = data_dict['sza'][:, y, x][data_dict['qa_passer'][:, y, x]]
+        vza = data_dict['vza'][:, y, x][data_dict['qa_passer'][:, y, x]]
+        raa = data_dict['saa'][:, y, x][data_dict['qa_passer'][:, y, x]] - data_dict['vaa'][:, y, x][data_dict['qa_passer'][:, y, x]]
         rho = np.zeros((sza.shape[0], 7))
-        for b in xrange(7):
-            rho[:, b] = d['b0%d' % (b+1)][:, y, x][d['qa_passer'][:, y, x]]
-        doys = d['doys'][d['qa_passer'][:, y, x]]
-        years = d['years'][d['qa_passer'][:, y, x]]
 
-        #print 'doys:', doys.shape
-        #print 'years: ', years.shape
-        #print 'y, x:', y, x
-        #print 'qa_passer: ', d['qa_passer'][:, y, x].shape
-        ind = np.array(np.where(d['qa_passer'][:, y, x] == 1))
-        # if len(ind[0]) > 0:
-        #     print 'qa_passer true ', ind[0].shape
-        # else:
-        #     print 'all pixels are not good', ind
+        for b in xrange(7):
+            rho[:, b] = data_dict['b0%d' % (b + 1)][:, y, x][data_dict['qa_passer'][:, y, x]]
+        doys = data_dict['doys'][data_dict['qa_passer'][:, y, x]]
+        years = data_dict['years'][data_dict['qa_passer'][:, y, x]]
+
+        ind = np.array(np.where(data_dict['qa_passer'][:, y, x] == 1))
 
         # Make DOYs continuous
-        # doys[years == years[0] + 1] = doys[years == years[0] + 1] + 365
-        # doys[years == years[0] + 2] = doys[years == years[0] + 2] + 365 * 2
-        # doys[years == years[0] + 1] = doys[years == years[0] + 1] + np.max(d['doys'])
-        # doys[years == years[0] + 2] = doys[years == years[0] + 2] + np.max(d['doys']) * 2
-        doys[years == d['years'][0] + 1] = doys[years == d['years'][0] + 1] + np.max(d['doys'])
-        doys[years == d['years'][0] + 2] = doys[years == d['years'][0] + 2] + np.max(d['doys']) * 2
-
-
-        # vza = np.append(vza, vza0)
-        # sza = np.append(sza, sza0)
-        # raa = np.append(raa, raa0)
-        # # doys = np.append(doys, doys0 + 365 * i)
-        # doys = np.append(doys, doys0 + 365)
-        # years = np.append(years, years0)
-        # rho = np.append(rho, rho0, axis=0)
-        # rho = np.delete(rho, 0, 0)
+        doys[years == data_dict['years'][0] + 1] = doys[years == data_dict['years'][0] + 1] + np.max(data_dict['doys'])
+        doys[years == data_dict['years'][0] + 2] = doys[years == data_dict['years'][0] + 2] + np.max(data_dict['doys']) * 2
 
         return rho, doys, years, sza, vza, raa
 
 
-    # ***************************************************************************
-
 
     def plot_results(self, x_sol, y_fwd, bhr_spectral_nbar, bhr_spectral_nbar_unc, bhr_spectral, rho, doy_range, doys):
+        """
+        Plot results of inversion (solution - x_sol)
+
+        :param x_sol: array
+            Array of solution: 3 kernels
+        :param y_fwd: array
+            Result of forward model run
+        :param bhr_spectral_nbar: array
+            Reflectance at nadir
+        :param bhr_spectral_nbar_unc: array
+            Uncertainty of reflectance
+        :param bhr_spectral: array
+            Directional output reflectance
+        :param rho: array
+            Original reflectance
+        :param doy_range: array
+            Range of output DOYs
+        :param doys:
+            Original DOYs
+        :return:
+        """
         n_doys = x_sol.shape[0] / 3
 
         doy_range = np.arange(np.min(doy_range), np.max(doy_range) + 1)
@@ -926,11 +964,6 @@ class opt_img(object):
         plt.figure(figsize=(15,10))
         plt.subplot(2,2,1)
         plt.title('NIR')
-        # plt.fill_between(doy_range2,\
-        #                  bhr_spectral_nbar[:, 1] - bhr_spectral_nbar_unc[:, 1], \
-        #                  bhr_spectral_nbar[:, 1] + bhr_spectral_nbar_unc[:, 1], color="0.9")
-        # plt.plot(doy_range2, bhr_spectral_nbar[:, 1], c='c', lw=2)
-        # plt.plot(doy_range2, bhr_spectral[:, 1], c='g', lw=2)
 
         ind = np.logical_and(doy_range >= self.min_doy, doy_range < self.max_doy)
         plt.plot(doy_range[ind], x_sol[:n_doys, 1][ind], c='c', lw=5)
@@ -944,41 +977,19 @@ class opt_img(object):
 
         plt.subplot(2,2,2)
         plt.title('Vis')
-        # plt.fill_between(doy_range2, \
-        #                  bhr_spectral_nbar[:, 0] - bhr_spectral_nbar_unc[:, 0], \
-        #                  bhr_spectral_nbar[:, 0] + bhr_spectral_nbar_unc[:, 0], color='r', alpha=0.2)
-        # plt.plot(doy_range2, bhr_spectral_nbar[:, 0], c='r', lw=2)
-        # plt.fill_between(doy_range2, \
-        #                  bhr_spectral_nbar[:, 2] - bhr_spectral_nbar_unc[:, 2], \
-        #                  bhr_spectral_nbar[:, 2] + bhr_spectral_nbar_unc[:, 2], color='b', alpha=0.2)
-        # plt.plot(doy_range2, bhr_spectral_nbar[:, 2], c='b', lw=2)
-        # plt.fill_between(doy_range2, \
-        #                  bhr_spectral_nbar[:, 3] - bhr_spectral_nbar_unc[:, 3], \
-        #                  bhr_spectral_nbar[:, 3] + bhr_spectral_nbar_unc[:, 3], color='g', alpha=0.2)
-        # plt.plot(doy_range2, bhr_spectral_nbar[:, 3], c='g', lw=2)
 
         plt.plot(doy_range[ind], x_sol[:n_doys, 0][ind], c='c', lw=5)
         plt.plot(doy_range, x_sol[:n_doys, 0], c='Orange', lw=2)
 
         plt.plot(doys, rho[:, 0], marker='.', ls='', c='r')
-        # plt.plot(doys, rho[:, 2], marker='x', ls='', c='b')
-        # plt.plot(doys, rho[:, 3], marker='x', ls='', c='g')
-
 
         plt.ylim(-0.01, np.max(y_fwd[:, np.array([0,2,3])])+0.06)
         plt.grid()
 
         plt.subplot(2,2,3)
         plt.title('NDVI')
-        # plt.plot(doy_range, (x_sol[:(n_doys), 1] - x_sol[:(n_doys), 0])/(x_sol[:(n_doys), 1] + x_sol[:(n_doys), 0]), c='k', lw=2)
-        # plt.plot(doy_range2,\
-        #          (bhr_spectral_nbar[:, 1] - bhr_spectral_nbar[:, 0]) / (bhr_spectral_nbar[:, 1] + bhr_spectral_nbar[:, 0]),
-        #          c='k', lw=2)
-        #plt.plot(doy_range, bhr_spectral[:, 3], c='g')
-        # plt.plot(doy_range, bhr_spectral[:, 1], c='m')
-        #plt.plot(doys, rho[:, 1], marker='o', ls='--', c='r')
+
         plt.plot(doys, (rho[:,1] - rho[:,0])/(rho[:,1] + rho[:,0]), '--')
-        #plt.plot(doys, rho[:, 3], marker='o', ls='--', c='g')
         plt.ylim(0, 1)
         plt.grid()
 
@@ -989,13 +1000,9 @@ class opt_img(object):
         plt.plot ( doy_range, x_sol[(2 * n_doys):, 1], ':', lw=2, label='Geometric')
         plt.legend()
 
-        #plt.ylim(-0.3,1.3)
         plt.grid()
         plt.show()
-        # plt.savefig('fig/' + fname.split('/')[-1].split('.')[0] + '.png')
 
-
-    # *********************************************************************************************************************
 
 
     def create_netcdf(self, netcdf_file, cols, rows, doy_range, do_zlib=True):
@@ -1005,7 +1012,15 @@ class opt_img(object):
         Parameters
         ----------
         netcdf_file: str
-            file to write
+            Name of NETCDF file to write
+        cols: array
+            Columns
+        rows: array
+            Rows
+        doy_range: array
+            Range of DOYs
+        do_zlib: bool
+            Do ZLIB compression
 
         Returns
         --------
@@ -1087,30 +1102,37 @@ class opt_img(object):
         lon.units = "longitude"
 
         # save geo information and projection
-        # nchar_proj = len(proj_str)
-        # nchar_geo = len(geo_str)
         rootgrp.createDimension('nchar_proj', 400)
         rootgrp.createDimension('nchar_geo', 100)
         rootgrp.createVariable('proj', 'S1', ('nchar_proj'))
         rootgrp.createVariable('geo_transform', 'S1', 'nchar_geo')
 
-        # proj_char = nc.stringtochar(np.array([proj_str], 'S%d' % nchar_proj))
-        # geo_char = nc.stringtochar(np.array([geo_str], 'S%d' % nchar_geo))
-        # rootgrp.variables['proj'][:] = proj_char
-        # rootgrp.variables['geo_transform'][:] = geo_char
-
         return rootgrp
 
-
-    # **********************************************
 
 
     def make_albedo(self, x_sol, unc, nbands=7):
         """
         Calculate broad band albedo and reflectance for given BRDF kernel solution
 
-        :param x_sol:
-        :return: bhr_spectral, bhr_spectral_unc, bhr_bb, bhr_bb_unc
+        :param x_sol: array
+            Ouput solution which consists of three kernels
+        :param unc: array
+            Posteriour uncertainty
+        :return:
+        bhr_spectral: array
+            Output directional reflectance
+        bhr_spectral_unc: array
+            Uncertainty of output directional reflectance
+        bhr_bb: array
+            Broad band albedo
+        bhr_bb_unc:: array
+            Uncertainty of the broad band albedo
+        bhr_spectral_nbar:
+            Output reflectance at nadir
+        bhr_spectral_nbar_unc
+            Uncertainty of the output reflectance at nadir
+
         """
 
         n_doys = x_sol.shape[0] / 3
@@ -1149,7 +1171,6 @@ class opt_img(object):
                      normalise=1, RecipFlag=True, RossHS=False, MODISSPARSE=True, \
                      RossType='Thick')
 
-        # n_doys = x_sol.shape[0] / 3
         for band in xrange(self.nbands):
             bhr_spectral_nbar[:, band] = (x_sol[:(n_doys), band] +
                                           kr.Ross[0] * x_sol[(n_doys):(2 * n_doys), band] +
@@ -1165,23 +1186,28 @@ class opt_img(object):
                bhr_spectral_nbar[self.min_doy:self.max_doy], bhr_spectral_nbar_unc[self.min_doy:self.max_doy]
 
 
-    # *******************************************************************************************
 
-
-    def do_window(self, netcdf, output, year, cols, rows, cx, cy, n_days, doys, doy_range):
+    def do_window(self, netcdf, data_dict, year, cols, rows, cx, cy, n_days, doys, doy_range):
         """
-        Solve problem for each pixel inside moving window.
+        Solve problem for each pixel inside the moving window.
 
         Parameters
         --------------------
-        ff: dictionary
-            hdf file dictionary where we want to save result
-        fnames: array
-            an array of file names
+        netcdf: NETCDF dictionary
+        data_dict: dictionary
+            Input data dictionary
+        year: int
+        cols: int
+            Number of columns
+        rows: int
+            Number of rows
         cx: int
             x pixel coordinate of window centre
         cy: int
             y pixel coordinate of window centre
+        n_days: int
+        doys: array
+        doy_range: array
         """
 
         win_x = np.arange(cols)
@@ -1192,10 +1218,7 @@ class opt_img(object):
         # ------------------------------------------------
         # get random coordinates for estimation of gamma using only 'good' pixels
 
-        # gx_coord = (np.random.rand(cols / 3 + 1) * cols).astype(int)
-        # gy_coord = (np.random.rand(rows / 3 + 1) * rows).astype(int)
-
-        ind = np.where(output['qa_passer'] == True)
+        ind = np.where(data_dict['qa_passer'] == True)
         if ind[0].shape[0] == 0:
             print 'no good pixels for this window'
             return -1
@@ -1211,21 +1234,17 @@ class opt_img(object):
         # Estimate gamma for several random coordinates
         gamma_rand = []
         for ii in xrange(gx_coord.shape[0]):
-            # print 'estimating gamma N ', ii, gx_coord[ii], gy_coord[ii]
-            if np.array(output['doys'][output['qa_passer'][:, gy_coord[ii], gx_coord[ii]]]).shape[0] > 10:
-                rho, doys, years, sza, vza, raa = self.get_rho(output, gx_coord[ii], gy_coord[ii])
+            if np.array(data_dict['doys'][data_dict['qa_passer'][:, gy_coord[ii], gx_coord[ii]]]).shape[0] > 10:
+                rho, doys, years, sza, vza, raa = self.get_rho(data_dict, gx_coord[ii], gy_coord[ii])
 
                 #!!!!!!!!!!!!!!!!!!!!!!!!!!!!
                 # doy_range = np.unique(doys)
                 #!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
                 passer = (doys - 1).astype(np.int)
-                # gamma = 10000000000
                 gamma_arr = []
                 opt_rmse_arr = []
                 # We can evaluate gamma several time and choose the best one
-
-                # print 'ready to guess gamma with rho', rho.shape
                 timeBefore = time.clock()
                 for i in xrange(3):
                     gamma0, opt_rmse0 = self.guess_gamma_opt(rho, sza, vza, raa, self.bu, doys,\
@@ -1235,13 +1254,10 @@ class opt_img(object):
                     opt_rmse_arr = np.append(opt_rmse_arr, opt_rmse0)
                 timeAfter = time.clock()
                 elapsed_time = timeAfter - timeBefore
-                # print 'guessing gamma elapsed time (s): ', elapsed_time
                 
                 gamma_rand = np.append(gamma_rand, gamma_arr[opt_rmse_arr.argmin()])
                 gamma_rand, g_ind = np.unique(gamma_rand, return_index=True)
-            # else:
-            #     print 'QA for gamma has not passed'
-        # print 'opt gamma:', gamma_rand
+
         if gamma_rand == []:
             print 'no gamma'
             return -1
@@ -1259,9 +1275,6 @@ class opt_img(object):
                                                                                           vza, sza, raa, rho, \
                                                                                           do_unc=True, \
                                                                                           doy_range=doy_range)
-                # if ii == 0:
-                #     plt.plot(x_sol[:,1])
-                #     plt.show()
                 I = np.diag(np.ones(np.max(doy_range) * 3))
                 D = (I - np.roll(I, -1)).T
                 for band in xrange(7):
@@ -1274,13 +1287,8 @@ class opt_img(object):
                         print 'D: '. D.shape
                         print 'doy_range: ', doy_range, np.max(doy_range)
                         continue
-            # plt.plot(x_sol[:, 1])
-            # plt.show()
-            # plt.plot(gamma_arr[:, 1])
-            # plt.show()
+
             gamma_opt_arr[:, :, ii] = gamma_arr
-
-
 
         # ----------------------------------------------------
         # Do inversion for every pixel
@@ -1288,7 +1296,6 @@ class opt_img(object):
         for xi, xx in enumerate(win_x):
             for yi, yy in enumerate(win_y):
 
-                # print 'pixel:', xx, yy
                 timeBefore0 = time.clock()
 
                 # Get reflectance and then estimate optimal gamma for a given pixel.
@@ -1296,26 +1303,21 @@ class opt_img(object):
                 # gamma-pixel and a current pixel
 
                 # Get number of DOYs
-                n_doys = np.array(output['doys']).shape[0]
+                n_doys = np.array(data_dict['doys']).shape[0]
                 # and number of DOYs which have passed QA
-                n_doys_good = np.array(output['doys'][output['qa_passer'][:, yi, xi]]).shape[0]
-                # print 'n_doys=', n_doys
-                # print 'n_doys_good=', n_doys_good
+                n_doys_good = np.array(data_dict['doys'][data_dict['qa_passer'][:, yi, xi]]).shape[0]
 
                 # if number of 'good' days in pixel more than N go further
                 if n_doys_good > 10:
-                    # print 'get rho for xi=%d, yi=%d'%(xi, yi)
-                    rho, doys, years, sza, vza, raa = self.get_rho(output, xi, yi)
+                    rho, doys, years, sza, vza, raa = self.get_rho(data_dict, xi, yi)
                 else:
-                    # print 'pixel (%d,%d) is not good'%(xx, yy)
                     continue
 
                 diff = []
-                # print 'estimate gamma for current pixel'
+
                 for ii, gamma in enumerate(gamma_rand):
-                    if np.array(output['doys'][output['qa_passer'][:, gy_coord[g_ind][ii], gx_coord[g_ind][ii]]]).shape[0] > 10:
-                        # print 'get rho for gamma=%.5f' % gamma
-                        grho, gdoys, gyears, gsza, gvza, graa = self.get_rho(output, gx_coord[g_ind][ii], gy_coord[g_ind][ii])
+                    if np.array(data_dict['doys'][data_dict['qa_passer'][:, gy_coord[g_ind][ii], gx_coord[g_ind][ii]]]).shape[0] > 10:
+                        grho, gdoys, gyears, gsza, gvza, graa = self.get_rho(data_dict, gx_coord[g_ind][ii], gy_coord[g_ind][ii])
 
                         # Make arrays of reflectance comparable
                         rho0 =  np.zeros((doy_range.shape[0], 7))
@@ -1329,30 +1331,21 @@ class opt_img(object):
                                 grho0[jj-1, :] = np.mean(grho[gdoys==dd, :], axis=0)
 
                         diff = np.append(diff, np.sum((rho0 - grho0)**2))
-                    # else:
-                        # print 'something wrong', gy_coord[g_ind][ii], gx_coord[g_ind][ii]
-                        # print np.array(output['doys'][output['qa_passer'][:, gy_coord[g_ind][ii], gx_coord[g_ind][ii]]]).shape[0]
+
                 if diff == []:
                     # if diff is empty break the loop and go to next pixel
-                    # print 'diff is empty'
                     continue
                 gamma = gamma_rand[np.argmin(diff)]
 
-                # print 'ready to solve problem with rho ', rho.shape
                 timeBefore = time.clock()
-                # try:
+
                 x_sol, rmse, y_fwd, y_orig = self.solve_regularised_problem(gamma, self.bu, doys, vza, sza, raa, rho,
                                                                                 do_unc=False, doy_range=doy_range)
-                # except:
-                    # print 'regularised problem for pixel %d %d has not solved' % (xx, yy)
-                    # continue
+
                 timeAfter = time.clock()
 
-
                 elapsed_time = timeAfter - timeBefore
-                # print '1st solving elapsed time (s): ', elapsed_time
-                                                             
-                # print 'filter outliers'
+
                 rpasar, pasar = self.outlier_filter(doys, rho, y_fwd, self.bu,\
                                                     'fig/outlier_%d_%d.png'%(xi, yi), threshold=10., do_plots=False)
                 doys = doys[pasar]
@@ -1361,11 +1354,7 @@ class opt_img(object):
                 vza = vza[pasar]
                 raa = raa[pasar]
 
-                # print 'solve problem with outliers filtered with rho, ', rho.shape
                 timeBefore = time.clock()
-
-
-
 
                 #***********************************
                 # Start the edge-preserving thing with gamma-arrays
@@ -1375,16 +1364,8 @@ class opt_img(object):
                                                                                           do_unc=True,\
                                                                                           doy_range=doy_range)
 
-					
-					
                 if x_sol[0,0] == -1:
-                    # print '**********************************************'
-                    # print 'go to the next pixel'
-                    # print '**********************************************'
                     continue
-                # except:
-                #     print 'regularised problem for pixel %d %d has not solved' % (xx, yy)
-                #     continue
 
                 timeAfter = time.clock()
                 elapsed_time = timeAfter - timeBefore
@@ -1393,35 +1374,14 @@ class opt_img(object):
                 bhr_bb, bhr_bb_unc, \
                 bhr_spectral_nbar, bhr_spectral_nbar_unc = self.make_albedo(x_sol, unc)
 
-                # self.plot_results(x_sol, y_fwd, bhr_spectral_nbar, bhr_spectral_nbar_unc, bhr_spectral, rho, doy_range,
-                #                   doys)
-
-                # print '2nd solving elapsed time (s): ', elapsed_time
-                # print 'get an answer and ready to save result in netcdf'
-
-
                 # Copy results of forward modeling to a hdf file
                 # We go around of the central pixel of window
-                # netcdf.groups['reflectance'].variables['y_fwd'][cy + yy, cx + xx, :, :] = y_fwd[self.min_doy:self.max_doy, :]
 
                 ind = np.logical_and(doy_range >= self.min_doy, doy_range < self.max_doy)
-
-                # netcdf.groups['reflectance'].variables['y_fwd'][yy, xx, :, :] = y_fwd[self.min_doy:self.max_doy, :]
-
-                # print 'netcdf.groups[reflectance].variables[y_fwd][:, :, yy, xx]',\
-                #       netcdf.groups['reflectance'].variables['y_fwd'][:, :, yy, xx].shape
-                # print 'y_fwd[self.min_doy:self.max_doy, :]', y_fwd[self.min_doy:self.max_doy, :].shape
 
                 netcdf.groups['reflectance'].variables['y_fwd'][:, :, yy, xx] = y_fwd[self.min_doy:self.max_doy, :]
 
                 netcdf.groups['reflectance'].variables['y_orig'][:, :, yy, xx] = y_orig[self.min_doy:self.max_doy, :]
-
-                # for bb in range(1, 8):
-                #     np.savez('covariance_%s/unc_%d-%d_%d_%d_band_%d_m' % (site, year_range[0], year_range[-1], xx, yy, bb), \
-                #              data=cov_mat[bb - 1].data, indices=cov_mat[bb - 1].indices, \
-                #              indptr=cov_mat[bb - 1].indptr, shape=cov_mat[bb - 1].shape)
-
-
 
                 # Write to array
                 for band in xrange(7):
@@ -1439,75 +1399,60 @@ class opt_img(object):
                     netcdf.groups["albedo"].variables["albedo_%s" % bb_name[band]][:, yy, xx] = bhr_spectral_nbar[:, band]
                     netcdf.groups["albedo"].variables["albedo_%s_sd" % bb_name[band]][:, yy, xx] = bhr_spectral_nbar_unc[:, band]
 
-                # print 'output[doys_real]:', output['doys_real']
-                # print 'output[doys_real]:', output['doys_real'][self.min_doy:self.max_doy]
-                # print 'self.min_doy, self.max_doy', self.min_doy, self.max_doy
-
-                date = np.array([julday.doy2date(year, d) for d in output['doys_real'][self.min_doy:self.max_doy]])
-                # date = np.array([julday.doy2date(year, d) for d in output['doys_real'][:]])
+                date = np.array([julday.doy2date(year, d) for d in data_dict['doys_real'][self.min_doy:self.max_doy]])
                 date_str = np.array([d.strftime('%Y.%m.%d') for d in date])
                 date_jul = np.array([julday.date2jul(d) for d in date])
 
                 # Range of dates for one year \\\\\
                 nd, dr = self.get_n_days(year)
 
-                # date_str = np.array([(datetime.date(year, 1, 1) +\
-                #                            datetime.timedelta(days=i)).strftime('%Y.%m.%d') \
-                #                            for i in xrange(0, nd)])
-
-                # print 'date_str:'
-                # print date_str.shape
-                # print date_str
-                # print netcdf.variables['date_str'].shape
-                # print date_jul
-
                 date_jul = []
                 for dd in xrange(date_str.shape[0]):
                     netcdf.variables['date_str'][dd,:] = [ss for ss in date_str[dd]]
                     tmp = np.array(date_str[dd].split(".")).astype(int)
-                    # date_jul = np.append(date_jul, np.round(julday.date2jul(dt(tmp[0], tmp[1], tmp[2]))).astype(int))
+
                     date_jul = np.append(date_jul, julday.date2jul(dt(tmp[0], tmp[1], tmp[2])))
 
                 netcdf.variables['julday'][:] = date_jul
-                
-                #netcdf.variables['lat'][cy + yy, cx + xx] = output['lat'][yi, xi]
-                #netcdf.variables['lon'][cy + yy, cx + xx] = output['lon'][yi, xi]
 
                 timeAfter0 = time.clock()
                 elapsed_time = timeAfter0 - timeBefore0
-                # print 'total time (s) for pixel: ', elapsed_time
-        # ------------------------------------------------------------------------------------------
-
-        # self.plot_results(x_sol, y_fwd, bhr_spectral_nbar, bhr_spectral_nbar_unc, bhr_spectral, rho, doy_range, doys)
-
-
-
-    # *******************************************************************************************
 
 
 
     def do_job(self, nc_file, loc, pattern, year, tile, ul_px, ul_py, lr_px, lr_py, cols, rows, \
                step=1, do_adj_years=True, do_vrt = False):
         """
-        Do the main job. Call the routine of hdf5 creation, estimate gamma,
-        solve regularized problem and save a hdf5 file.
+        Do the main job. Call the routine of netcdf creation, estimate gamma,
+        solve regularized problem and save a netcdf file.
 
         Parameters
         -----------
-        hdf_dir: string
-        loc: array
-        site: string
-        year_range: array
+        nc_file: string
+            Name of the output netcdf file
+        loc: string
+            Directory of data
+        pattern: string
+        year: int
         tile: string
-        ul_x: float
-        ul_y: float
-        lr_x: float
-        lr_y: float
+            MODIS tile
+        ul_px: int
+            Upper Left X-pixels coordinate
+        ul_py: int
+            Upper Left Y-pixel coordinate
+        lr_px: int
+            Lower Right X-pixel coordinate
+        lr_py: int
+            Lower Left Y-pixel coordinate
         cols: int
             window size x
         rows: int
             window size y
+        step: int
+        do_adj_years: bool
+            Use or not +/- one year for solution
         do_vrt: bool
+            Make virtual dataset
         """
 
         timeBefore = time.clock()
@@ -1516,9 +1461,6 @@ class opt_img(object):
         N = (lr_px-ul_px) / int(cols) * cols
         M = (lr_py-ul_py) / int(rows) * rows
 
-        # print 'ul_px, ul_py, lr_px, lr_py  = ', ul_px, ul_py, lr_px, lr_py
-        # print 'Image size: %dx%d' % (N, M)
-        # print 'Window size: %dx%d' % (cols, rows)
         if (lr_px-ul_px) < cols:
             print 'x size of the image must be >= than x size of window'
             return -1
@@ -1540,24 +1482,23 @@ class opt_img(object):
             for py in xrange(ul_py, ul_py+M, rows):
                 n_days, dr = self.get_n_days(year - 1)
 
-                # print 'Read time series\n'
-                output = OrderedDict()
-                output_2 = self.get_time_series(tile, year, loc, px, py, cols, rows, step=step, save_dir='data/')
+                data_dict = OrderedDict()
+                data_dict_now = self.get_time_series(tile, year, loc, px, py, cols, rows, step=step, save_dir='data/')
                 if do_adj_years:
-                    output_1 = self.get_time_series(tile, year-1, loc, px, py, cols, rows, step=step, save_dir='data/')
-                    output_3 = self.get_time_series(tile, year+1, loc, px, py, cols, rows, step=step, save_dir='data/')
-                    if output_2 == -1:
+                    data_dict_before = self.get_time_series(tile, year-1, loc, px, py, cols, rows, step=step, save_dir='data/')
+                    data_dict_after = self.get_time_series(tile, year+1, loc, px, py, cols, rows, step=step, save_dir='data/')
+                    if data_dict_now == -1:
                         continue
-                    if output_1 == -1:
-                        output_1 = output_2.copy()
-                        output_1['years'] = output_1['years'] - 1
-                    if output_3 == -1:
-                        output_3 = output_2.copy()
-                        output_3['years'] = output_3['years'] + 1
-                    keys = output_2.keys()
+                    if data_dict_before == -1:
+                        data_dict_before = data_dict_now.copy()
+                        data_dict_before['years'] = data_dict_before['years'] - 1
+                    if data_dict_after == -1:
+                        data_dict_after = data_dict_now.copy()
+                        data_dict_after['years'] = data_dict_after['years'] + 1
+                    keys = data_dict_now.keys()
                     for key in keys:
-                        output[key] = np.append(output_1[key], output_2[key], axis=0)
-                        output[key] = np.append(output[key], output_3[key], axis=0)
+                        data_dict[key] = np.append(data_dict_before[key], data_dict_now[key], axis=0)
+                        data_dict[key] = np.append(data_dict[key], data_dict_after[key], axis=0)
                     nd1, dr = self.get_n_days(year - 1)
                     nd2, dr = self.get_n_days(year)
                     nd3, dr = self.get_n_days(year + 1)
@@ -1569,13 +1510,13 @@ class opt_img(object):
                     n_days, dr = self.get_n_days(year)
                     self.min_doy = 0
                     self.max_doy = n_days
-                    output = output_2
+                    data_dict = data_dict_now
 
-                doys = output['doys'].copy()
-                years = output['years'].copy()
+                doys = data_dict['doys'].copy()
+                years = data_dict['years'].copy()
 
-                doys[years == years[0] + 1] = doys[years == years[0] + 1] + np.max(output['doys'])
-                doys[years == years[0] + 2] = doys[years == years[0] + 2] + np.max(output['doys']) * 2
+                doys[years == years[0] + 1] = doys[years == years[0] + 1] + np.max(data_dict['doys'])
+                doys[years == years[0] + 2] = doys[years == years[0] + 2] + np.max(data_dict['doys']) * 2
                 self.max_doy = np.max(doys[years == year])
                 self.min_doy = np.min(doys[years == year])
                 doy_range = np.unique(doys)
@@ -1583,9 +1524,8 @@ class opt_img(object):
                 # Create a netcdf file to store results
                 netcdf = self.create_netcdf(nc_file, N, M, doy_range[self.min_doy : self.max_doy])
 
-                # print 'do window for px=%d, py=%d\n' % (px, py)
                 # Move central pixels and thus do processing inside a new window
-                self.do_window(netcdf, output, year, cols, rows, cx, cy, n_days, doys, doy_range)
+                self.do_window(netcdf, data_dict, year, cols, rows, cx, cy, n_days, doys, doy_range)
 
                 cy = cy + rows
 
@@ -1598,25 +1538,19 @@ class opt_img(object):
         return 0
 
 
-# *******************************************************************************************
 
 
-# *******************************************************************************************
-# MAIN
-# *******************************************************************************************
+
 
 if __name__ == "__main__":
     """
-    An example of call:
-    python brdf_filter_img_12.py -s 'viterbo' -t 'h18v04' -y 42.38041111 -x 12.02656111 -g 2014 
+    MAIN
     """
 
     timeBefore = time.clock()
 
     parser = optparse.OptionParser(formatter=optparse.TitledHelpFormatter(),
                                    usage=globals()['__doc__'])
-    #python %s --ncd_out %s --root %s --pattern %s --ulx %d --uly %d --cols %d --rows %d --tile %s --year %s
-
 
     parser.add_option('--ncd_out', action="store", dest="ncd_out",
                       type=str, help="output netCDF file")
@@ -1650,21 +1584,18 @@ if __name__ == "__main__":
 
 
     (options, args) = parser.parse_args()
-    # site = options.site
     tile = options.tile
 
     print 'tile:',  options.tile
     print 'ul x: ', options.ulx
     print 'ul y: ', options.uly
-    # year = options.pattern[8:12]
     print 'year:', options.year
     lrx = int(options.ulx) + int(options.cols)
     lry = int(options.uly) + int(options.rows)
     print 'lr x', lrx
     print 'lr y', lry
-    # print 'year: ', year
 
-    brf = opt_img()
+    brf = OptImg()
 
     brf.do_job(options.ncd_out, options.root, options.pattern, int(options.year),\
                options.tile,\
